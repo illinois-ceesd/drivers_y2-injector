@@ -1,0 +1,17 @@
+nviz: 10
+nrestart: 10
+nhealth: 1
+nstatus: 1
+current_dt: 1.0e-9
+t_final: 2.e-8
+order:  2
+alpha_sc: 0.01
+s0_sc: -5.0
+kappa_sc: 0.5
+integrator: euler
+nspecies: 2
+health_pres_min: 2727
+health_pres_max: 287809
+#health_pres_min: 10
+#health_pres_max: 300000
+log_dependent: 0
