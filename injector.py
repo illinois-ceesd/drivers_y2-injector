@@ -258,12 +258,9 @@ class InitACTII:
         ypos = x_vec[1]
         if self._dim == 3:
             zpos = x_vec[2]
-        ytop = 0*x_vec[0]
         actx = xpos.array_context
         zeros = 0*xpos
         ones = zeros + 1.0
-
-        gamma = self._gamma_guess
 
         # initialize the bulk to P0, T0, and quiescent
         pressure = ones*self._P0
@@ -301,8 +298,11 @@ class InitACTII:
         yc_center = zeros - 0.0283245 + 4e-3 + 1.59e-3/2.
         zc_center = zeros + 0.035/2.
         inj_radius = 1.59e-3/2.
+        inj_bl_thickness = inj_radius/3.
 
-        if self._dim == 3:
+        if self._dim == 2:
+            radius = actx.np.sqrt((ypos - yc_center)**2)
+        else:
             radius = actx.np.sqrt((ypos - yc_center)**2 + (zpos - zc_center)**2)
 
         left_edge = actx.np.greater(xpos, xc_left)
@@ -331,47 +331,22 @@ class InitACTII:
         #inj_fuel_x0 = 0.7085
         # back inside the injector
         inj_fuel_x0 = 0.717
-        # out in the cavity
-        #inj_fuel_x0 = 0.7
-        inj_fuel_y0 = -0.0243245 - 3.e-3
-        inj_fuel_y1 = -0.0227345 + 3.e-3
-        inj_fuel_z0 = 0.035/2. - 3.e-3
-        inj_fuel_z1 = 0.035/2. + 3.e-3
         inj_sigma = 1500
+        inj_sigma_y = 10000
         #gamma_guess_inj = gamma
 
-        # seperate the fuel from the flow, allow the fuel to spill out into the
-        # cavity ahead of hte injection flow, see if this helps startup
         # left extent
         inj_tanh = inj_sigma*(inj_fuel_x0 - xpos)
         inj_weight = 0.5*(1.0 - actx.np.tanh(inj_tanh))
         for i in range(self._nspecies):
             inj_y[i] = y[i] + (inj_y[i] - y[i])*inj_weight
 
-        # bottom extent
-        inj_tanh = inj_sigma*(inj_fuel_y0 - ypos)
+        # transition the fuel from 1 at the centerline to 0 at the injector boundary
+        # radial extent
+        inj_tanh = inj_sigma_y*(radius - (inj_radius-inj_bl_thickness))
         inj_weight = 0.5*(1.0 - actx.np.tanh(inj_tanh))
         for i in range(self._nspecies):
             inj_y[i] = y[i] + (inj_y[i] - y[i])*inj_weight
-
-        # top extent
-        inj_tanh = inj_sigma*(ypos - inj_fuel_y1)
-        inj_weight = 0.5*(1.0 - actx.np.tanh(inj_tanh))
-        for i in range(self._nspecies):
-            inj_y[i] = y[i] + (inj_y[i] - y[i])*inj_weight
-
-        if self._dim == 3:
-            # aft extent
-            inj_tanh = inj_sigma*(inj_fuel_z0 - zpos)
-            inj_weight = 0.5*(1.0 - actx.np.tanh(inj_tanh))
-            for i in range(self._nspecies):
-                inj_y[i] = y[i] + (inj_y[i] - y[i])*inj_weight
-
-            # fore extent
-            inj_tanh = inj_sigma*(zpos - inj_fuel_z1)
-            inj_weight = 0.5*(1.0 - actx.np.tanh(inj_tanh))
-            for i in range(self._nspecies):
-                inj_y[i] = y[i] + (inj_y[i] - y[i])*inj_weight
 
         # transition the mach number from 0 (cavitiy) to 1 (injection)
         inj_tanh = inj_sigma*(inj_x0 - xpos)
@@ -422,16 +397,9 @@ class InitACTII:
         # isothermal boundaries
         sigma = self._temp_sigma_injection
         wall_temperature = self._temp_wall
-        smoothing_top = actx.np.tanh(sigma*(actx.np.abs(ypos-self._inj_ytop)))
-        smoothing_bottom = actx.np.tanh(sigma*(actx.np.abs(ypos-self._inj_ybottom)))
-
-        if self._dim == 2:
-            inj_temperature = (wall_temperature +
-                (inj_temperature - wall_temperature)*smoothing_top*smoothing_bottom)
-        else:
-            smoothing_radius = actx.np.tanh(sigma*(actx.np.abs(radius - inj_radius)))
-            inj_temperature = (wall_temperature +
-                (inj_temperature - wall_temperature)*smoothing_radius)
+        smoothing_radius = actx.np.tanh(sigma*(actx.np.abs(radius - inj_radius)))
+        inj_temperature = (wall_temperature +
+            (inj_temperature - wall_temperature)*smoothing_radius)
 
         inj_mass = eos.get_density(pressure=inj_pressure,
                                    temperature=inj_temperature,
@@ -442,13 +410,8 @@ class InitACTII:
         # modify the velocity in the near-wall region to have a tanh profile
         # this approximates the BL velocity profile
         sigma = self._vel_sigma_injection
-        smoothing_top = actx.np.tanh(sigma*(actx.np.abs(ypos-self._inj_ytop)))
-        smoothing_bottom = actx.np.tanh(sigma*(actx.np.abs(ypos-self._inj_ybottom)))
-        if self._dim == 2:
-            inj_velocity[0] = inj_velocity[0]*smoothing_top*smoothing_bottom
-        else:
-            smoothing_radius = actx.np.tanh(sigma*(actx.np.abs(radius - inj_radius)))
-            inj_velocity[0] = inj_velocity[0]*smoothing_radius
+        smoothing_radius = actx.np.tanh(sigma*(actx.np.abs(radius - inj_radius)))
+        inj_velocity[0] = inj_velocity[0]*smoothing_radius
 
         # use the species field with fuel added everywhere
         for i in range(self._nspecies):
@@ -518,8 +481,17 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         casename = "mirgecom"
 
     # logging and profiling
+    log_path = "log_data/"
+    logname = log_path + casename + ".sqlite"
+
+    if rank == 0:
+        import os
+        log_dir = os.path.dirname(logname)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
     logmgr = initialize_logmgr(use_logmgr,
-        filename=f"{casename}.sqlite", mode="wo", mpi_comm=comm)
+        filename=logname, mode="wo", mpi_comm=comm)
 
     if use_profiling:
         queue = cl.CommandQueue(cl_ctx,
@@ -572,7 +544,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     nspecies = 0
 
     # ACTII flow properties
-    total_pres_inflow = 101325
+    total_pres_inflow = 5000
     total_temp_inflow = 300
 
     # injection flow properties
@@ -770,6 +742,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     r = 8314.59/mw
     cp = r*gamma/(gamma - 1)
     Pr = 0.75
+    mf_c2h4 = 0.5
+    mf_h2 = 0.5
 
     if mu_override:
         mu = mu_input
@@ -1028,6 +1002,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     ref_state = PrescribedFluidBoundary(boundary_state_func=_ref_boundary_state_func)
     outflow = OutflowBoundary(boundary_pressure=total_pres_inflow)
     wall = IsothermalNoSlipBoundary()
+
+    print(f"{total_pres_inflow=}")
 
     boundaries = {
         #DTAG_BOUNDARY("outflow"): ref_state,

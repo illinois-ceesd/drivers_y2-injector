@@ -56,10 +56,12 @@ Printf("boundratioinjector = %f", boundratioinjector);
 
 
 //Cavity Start
-Point(450) = {0.65163,-0.0083245,0.0,basesize};
+//Point(450) = {0.65163,-0.0083245,0.0,basesize};
+Point(450) = {0.67,-0.0083245,0.0,basesize};
 
 //Bottom of cavity
-Point(451) = {0.65163,-0.0283245,0.0,basesize};
+//Point(451) = {0.65163,-0.0283245,0.0,basesize};
+Point(451) = {0.67,-0.0283245,0.0,basesize};
 Point(452) = {0.70163,-0.0283245,0.0,basesize};
 Point(453) = {0.72163,-0.0083245,0.0,basesize};
 
@@ -102,7 +104,6 @@ Physical Curve('wall') = {
 451,
 452,
 453,
-454,
 500,
 501,
 503
@@ -149,16 +150,16 @@ Field[6].VIn = cavitysize;
 Field[6].VOut = bigsize;
 
 // background mesh size for the injector
-injector_start = 0.69;
+injector_start = 0.70;
 injector_end = 0.75;
-injector_bottom = -0.0215;
+injector_bottom = -0.022;
 injector_top = -0.025;
 Field[7] = Box;
 Field[7].XMin = injector_start;
 Field[7].XMax = injector_end;
 Field[7].YMin = injector_bottom;
 Field[7].YMax = injector_top;
-Field[7].Thickness = 0.10;    // interpolate from VIn to Vout over a distance around the box
+Field[7].Thickness = 0.05;    // interpolate from VIn to Vout over a distance around the box
 Field[7].VIn = injectorsize;
 Field[7].VOut = bigsize;
 
