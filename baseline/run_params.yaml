@@ -2,14 +2,14 @@ nviz: 100
 nrestart: 100
 nhealth: 1
 nstatus: 1
-current_dt: 1.0e-8
+current_dt: 5.0e-9
 t_final: 2e-5
 order:  2
 alpha_sc: 0.01
 s0_sc: -5.0
 kappa_sc: 0.5
-integrator: lsrk54
-#integrator: euler
+#integrator: lsrk54
+integrator: euler
 #spec_diff: 1.e-5
 spec_diff: 0.
 nspecies: 2
