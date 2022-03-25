@@ -63,12 +63,21 @@ Point(450) = {0.67,-0.0083245,0.0,basesize};
 //Point(451) = {0.65163,-0.0283245,0.0,basesize};
 Point(451) = {0.67,-0.0283245,0.0,basesize};
 Point(452) = {0.70163,-0.0283245,0.0,basesize};
-Point(453) = {0.72163,-0.0083245,0.0,basesize};
+// slanty cavity
+//Point(453) = {0.72163,-0.0083245,0.0,basesize};
+// straight cavity
+Point(453) = {0.70163,-0.0083245,0.0,basesize};
 
-Point(500) = {0.70163+inj_h, -0.0283245+inj_h, 0., basesize};
-Point(501) = {0.70163+inj_h+inj_d, -0.0283245+inj_h, 0., basesize};
-Point(502) = {0.70163+inj_h+inj_d, -0.0283245+inj_h+inj_t, 0., basesize};
-Point(503) = {0.70163+inj_h+inj_t, -0.0283245+inj_h+inj_t, 0., basesize};
+// slanty cavity
+//Point(500) = {0.70163+inj_h, -0.0283245+inj_h, 0., basesize};
+//Point(501) = {0.70163+inj_h+inj_d, -0.0283245+inj_h, 0., basesize};
+//Point(502) = {0.70163+inj_h+inj_d, -0.0283245+inj_h+inj_t, 0., basesize};
+//Point(503) = {0.70163+inj_h+inj_t, -0.0283245+inj_h+inj_t, 0., basesize};
+// straight cavity
+Point(500) = {0.70163, -0.0283245+inj_h, 0., basesize};
+Point(501) = {0.70163+inj_d, -0.0283245+inj_h, 0., basesize};
+Point(502) = {0.70163+inj_d, -0.0283245+inj_h+inj_t, 0., basesize};
+Point(503) = {0.70163, -0.0283245+inj_h+inj_t, 0., basesize};
 
 //Make Cavity lines
 Line(451) = {450,451};
@@ -100,11 +109,14 @@ Physical Surface('domain') = {-1};
 
 Physical Curve('injection') = {-502};
 Physical Curve('outflow') = {454};
-Physical Curve('wall') = {
+Physical Curve('wall_cavity') = {
 451,
 452,
 453,
-500,
+500
+};
+
+Physical Curve('wall_injector') = {
 501,
 503
 };
