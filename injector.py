@@ -599,8 +599,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     t_final = 1e-7
     current_t = 0
     current_step = 0
-    current_cfl = 1.0
-    constant_cfl = False
+    current_cfl = 0.1
+    constant_cfl = True
 
     # default health status bounds
     health_pres_min = 1.0e-1
@@ -1156,13 +1156,12 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         if rank == 0:
             logger.info(status_msg)
 
-    def my_write_viz(step, t, cv, dv, ts_field, alpha_field):
+    def my_write_viz(step, t, cv, dv, ts_field, alpha_field,
+                     rhs=None, grad_cv=None, grad_t=None, grad_v=None,
+                     grad_y=None):
         tagged_cells = smoothness_indicator(discr, cv.mass, s0=s0_sc,
                                             kappa=kappa_sc)
-
-        mach = (actx.np.sqrt(np.dot(cv.velocity, cv.velocity)) /
-                            dv.speed_of_sound)
-
+        mach = cv.speed / dv.speed_of_sound
         viz_fields = [("cv", cv),
                       ("dv", dv),
                       ("mach", mach),
@@ -1174,6 +1173,12 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         viz_fields.extend(
             ("Y_"+species_names[i], cv.species_mass_fractions[i])
             for i in range(nspecies))
+        if rhs is not None:
+            viz_ext = [("rhs", rhs), ("grad_temperature", grad_t),
+                       ("grad_v_x", grad_v[0]), ("grad_v_y", grad_v[1])]
+            viz_ext.extend(("grad_Y_"+species_names[i], grad_y[i])
+                           for i in range(nspecies))
+            viz_fields.extend(viz_ext)
         write_visfile(discr, viz_fields, visualizer, vizname=vizname,
                       step=step, t=t, overwrite=True)
 
@@ -1351,8 +1356,20 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                 my_write_restart(step=step, t=t, cv=cv, temperature_seed=tseed)
 
             if do_viz:
+                from mirgecom.fluid import (
+                    velocity_gradient,
+                    species_mass_fraction_gradient
+                )
+                ns_rhs, grad_cv, grad_t = \
+                    ns_operator(discr, state=fluid_state, time=t,
+                                boundaries=boundaries, gas_model=gas_model,
+                                return_gradients=True)
+                grad_v = velocity_gradient(cv, grad_cv)
+                grad_y = species_mass_fraction_gradient(cv, grad_cv)
                 my_write_viz(step=step, t=t, cv=cv, dv=dv,
-                             ts_field=ts_field, alpha_field=alpha_field)
+                             ts_field=ts_field, alpha_field=alpha_field,
+                             rhs=ns_rhs, grad_cv=grad_cv, grad_t=grad_t,
+                             grad_v=grad_v, grad_y=grad_y)
 
         except MyRuntimeError:
             if rank == 0:
