@@ -75,7 +75,7 @@ from mirgecom.integrators import (rk4_step, lsrk54_step, lsrk144_step,
 from mirgecom.steppers import advance_state
 from mirgecom.boundary import (
     PrescribedFluidBoundary,
-    IsothermalNoSlipBoundary,
+    #IsothermalNoSlipBoundary,
     OutflowBoundary
 )
 import cantera
@@ -100,6 +100,82 @@ class MyRuntimeError(RuntimeError):
     """Simple exception to kill the simulation."""
 
     pass
+
+
+from grudge.trace_pair import TracePair
+from mirgecom.inviscid import inviscid_flux_rusanov
+
+
+class IsothermalWallBoundary(PrescribedFluidBoundary):
+    r"""Isothermal viscous wall boundary.
+    This class implements an isothermal wall by:
+    Pescribed flux, *not* with Riemann solver
+    """
+
+    def __init__(self, wall_temperature=300):
+        """Initialize the boundary condition object."""
+        self._wall_temp = wall_temperature
+        PrescribedFluidBoundary.__init__(
+            self, boundary_state_func=self.isothermal_wall_state,
+            inviscid_flux_func=self.inviscid_wall_flux,
+            boundary_temperature_func=self.temperature_bc
+        )
+
+    def isothermal_wall_state(self, discr, btag, gas_model, state_minus, **kwargs):
+        """Return state with 0 velocities and energy(Twall)."""
+        temperature_wall = self._wall_temp + 0*state_minus.mass_density
+        mom_plus = state_minus.mass_density*0.*state_minus.velocity
+        mass_frac_plus = state_minus.species_mass_fractions
+
+        internal_energy_plus = gas_model.eos.get_internal_energy(
+            temperature=temperature_wall, species_mass_fractions=mass_frac_plus)
+
+        total_energy_plus = state_minus.mass_density*internal_energy_plus
+
+        cv_plus = make_conserved(
+            state_minus.dim, mass=state_minus.mass_density, energy=total_energy_plus,
+            momentum=mom_plus, species_mass=state_minus.species_mass_density
+        )
+        return make_fluid_state(cv=cv_plus, gas_model=gas_model,
+                                temperature_seed=state_minus.temperature)
+
+    def inviscid_wall_flux(
+            self, discr, btag, gas_model, state_minus,
+            numerical_flux_func=inviscid_flux_rusanov, **kwargs):
+
+        temperature_wall = self._wall_temp + 0*state_minus.mass_density
+        mom_plus = -state_minus.momentum_density
+        mass_frac_plus = state_minus.species_mass_fractions
+
+        internal_energy_plus = gas_model.eos.get_internal_energy(
+            temperature=temperature_wall, species_mass_fractions=mass_frac_plus)
+
+        total_energy_plus = (state_minus.mass_density*internal_energy_plus
+                             + .5*np.dot(mom_plus, mom_plus))
+
+        """Return Riemann flux using state with mom opposite of interior state."""
+        wall_cv = make_conserved(dim=state_minus.dim,
+                                 mass=state_minus.mass_density,
+                                 momentum=mom_plus,
+                                 #energy=state_minus.energy_density,
+                                 energy=total_energy_plus,
+                                 species_mass=state_minus.species_mass_density)
+        wall_state = make_fluid_state(cv=wall_cv, gas_model=gas_model,
+                                      temperature_seed=state_minus.temperature)
+        state_pair = TracePair(btag, interior=state_minus, exterior=wall_state)
+
+        from mirgecom.inviscid import inviscid_facial_flux
+        return self._boundary_quantity(
+            discr, btag,
+            inviscid_facial_flux(discr, gas_model=gas_model, state_pair=state_pair,
+                                 numerical_flux_func=numerical_flux_func,
+                                 local=True),
+            **kwargs)
+
+    def temperature_bc(self, state_minus, **kwargs):
+        """Get temperature value used in grad(T)."""
+        # return 2*self._wall_temp - state_minus.temperature
+        return 0.*state_minus.temperature + self._wall_temp
 
 
 def get_mesh(dim, read_mesh=True):
@@ -279,7 +355,7 @@ class InitACTII:
         # initially in pressure/temperature equilibrium with the cavity
         #inj_left = 0.71
         # even with the bottom corner
-        inj_left = 0.70563
+        inj_left = 0.70163
         # even with the top corner
         #inj_left = 0.7074
         #inj_left = 0.65
@@ -298,7 +374,8 @@ class InitACTII:
         yc_center = zeros - 0.0283245 + 4e-3 + 1.59e-3/2.
         zc_center = zeros + 0.035/2.
         inj_radius = 1.59e-3/2.
-        inj_bl_thickness = inj_radius/3.
+        #inj_bl_thickness = inj_radius/3.
+        inj_bl_thickness = -1000
 
         if self._dim == 2:
             radius = actx.np.sqrt((ypos - yc_center)**2)
@@ -329,8 +406,12 @@ class InitACTII:
         inj_x0 = 0.712
         # the entrace to the injector
         #inj_fuel_x0 = 0.7085
+        #inj_fuel_x0 = 0.705
         # back inside the injector
-        inj_fuel_x0 = 0.717
+        # behind the shock
+        #inj_fuel_x0 = inj_x0 + 0.002
+        # infront of the shock
+        inj_fuel_x0 = inj_x0 - 0.002
         inj_sigma = 1500
         inj_sigma_y = 10000
         #gamma_guess_inj = gamma
@@ -348,7 +429,7 @@ class InitACTII:
         for i in range(self._nspecies):
             inj_y[i] = y[i] + (inj_y[i] - y[i])*inj_weight
 
-        # transition the mach number from 0 (cavitiy) to 1 (injection)
+        # transition the mach number from 0 (cavity) to 1 (injection)
         inj_tanh = inj_sigma*(inj_x0 - xpos)
         inj_weight = 0.5*(1.0 - actx.np.tanh(inj_tanh))
         inj_mach = inj_weight*inj_mach
@@ -413,10 +494,9 @@ class InitACTII:
         smoothing_radius = actx.np.tanh(sigma*(actx.np.abs(radius - inj_radius)))
         inj_velocity[0] = inj_velocity[0]*smoothing_radius
 
-        # use the species field with fuel added everywhere
         for i in range(self._nspecies):
-            #y[i] = actx.np.where(inside_injector, inj_y[i], y[i])
-            y[i] = inj_y[i]
+            y[i] = actx.np.where(inside_injector, inj_y[i], y[i])
+            #y[i] = inj_y[i]
 
         # recompute the mass and energy (outside the injector) to account for
         # the change in mass fraction
@@ -750,6 +830,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     else:
         mu = mu_mix
 
+    # thermal conductivity
     kappa = cp*mu/Pr
     init_temperature = 300.0
 
@@ -1001,7 +1082,10 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
     ref_state = PrescribedFluidBoundary(boundary_state_func=_ref_boundary_state_func)
     outflow = OutflowBoundary(boundary_pressure=total_pres_inflow)
-    wall = IsothermalNoSlipBoundary()
+    wall_cavity = IsothermalWallBoundary()
+    wall_injector = IsothermalWallBoundary()
+    #wall_cavity = IsothermalNoSlipBoundary()
+    #wall_injector = IsothermalNoSlipBoundary()
 
     print(f"{total_pres_inflow=}")
 
@@ -1009,7 +1093,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         #DTAG_BOUNDARY("outflow"): ref_state,
         DTAG_BOUNDARY("outflow"): outflow,
         DTAG_BOUNDARY("injection"): ref_state,
-        DTAG_BOUNDARY("wall"): wall
+        DTAG_BOUNDARY("wall_cavity"): wall_cavity,
+        DTAG_BOUNDARY("wall_injector"): wall_injector
     }
 
     visualizer = make_visualizer(discr)
@@ -1329,8 +1414,10 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         fluid_state = make_fluid_state(cv=cv, gas_model=gas_model,
                                        temperature_seed=tseed)
         alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
+        #from mirgecom.inviscid import inviscid_flux_hll
         cv_rhs = (
             ns_operator(discr, state=fluid_state, time=t, boundaries=boundaries,
+                        #inviscid_numerical_flux_func=inviscid_flux_hll,
                         gas_model=gas_model, quadrature_tag=quadrature_tag)
             + eos.get_species_source_terms(cv,
                                            temperature=fluid_state.temperature)

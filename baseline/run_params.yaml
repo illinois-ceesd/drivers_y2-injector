@@ -10,7 +10,8 @@ s0_sc: -5.0
 kappa_sc: 0.5
 integrator: lsrk54
 #integrator: euler
-spec_diff: 1.e-4
+#spec_diff: 1.e-5
+spec_diff: 0.
 nspecies: 2
 mach_inj: 0.5
 total_pres_inj: 1e4
