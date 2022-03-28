@@ -63,7 +63,9 @@ from mirgecom.simutil import (
     write_visfile,
     check_naninf_local,
     check_range_local,
-    get_sim_timestep
+    get_sim_timestep,
+    limit_species_mass_fractions,
+    species_fraction_anomaly_relaxation
 )
 from mirgecom.restart import write_restart_file
 from mirgecom.io import make_init_message
@@ -595,12 +597,12 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
     # default timestepping control
     integrator = "rk4"
-    current_dt = 1e-8
-    t_final = 1e-7
+    current_dt = 5.8e-10
+    t_final = 100.0
     current_t = 0
     current_step = 0
     current_cfl = 0.1
-    constant_cfl = True
+    constant_cfl = False
 
     # default health status bounds
     health_pres_min = 1.0e-1
@@ -619,7 +621,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
     # material properties
     mu = 1.0e-5
-    spec_diff = 1e-4
+    spec_diff = 1e-3
+
     mu_override = False  # optionally read in from input
     nspecies = 0
 
@@ -815,8 +818,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     mw_n2 = 14.0067*2
     mf_o2 = 0.273
     # viscosity @ 400C, Pa-s
-    mu_o2 = 3.76e-5
-    mu_n2 = 3.19e-5
+    mu_o2 = 3.76e-4
+    mu_n2 = 3.19e-4
     mu_mix = mu_o2*mf_o2 + mu_n2*(1-mu_o2)  # 3.3456e-5
     mw = mw_o2*mf_o2 + mw_n2*(1.0 - mf_o2)
     r = 8314.59/mw
@@ -1041,6 +1044,10 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
             logging.info("Restarting soln.")
         current_cv = restart_data["cv"]
         temperature_seed = restart_data["temperature_seed"]
+        init_state_fname = restart_pattern.format(cname=casename, step=0, rank=rank)
+        init_data = read_restart_data(actx, init_state_fname)
+        init_cv = init_data["cv"]
+        init_temp_seed = init_data["temperature_seed"]
         if restart_order != order:
             restart_discr = EagerDGDiscretization(
                 actx,
@@ -1053,21 +1060,25 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                 discr.discr_from_dd("vol"),
                 restart_discr.discr_from_dd("vol")
             )
-            current_cv = connection(restart_data["cv"])
-            temperature_seed = connection(restart_data["temperature_seed"])
-
+            current_cv = connection(current_cv)
+            init_cv = connection(init_cv)
+            temperature_seed = connection(temperature_seed)
+            init_temp_seed = connection(init_temp_seed)
         if logmgr:
             logmgr_set_time(logmgr, current_step, current_t)
     else:
         current_cv = bulk_init(discr=discr, x_vec=thaw(discr.nodes(), actx),
                                eos=eos, time=0)
+        current_cv = limit_species_mass_fractions(current_cv)
         temperature_seed = init_temperature
+        init_cv = current_cv
+        init_temp_seed = temperature_seed
 
     current_state = create_fluid_state(current_cv, temperature_seed)
     temperature_seed = current_state.temperature
+    target_state = create_fluid_state(init_cv, init_temp_seed)
 
     # eventually we want to read in a reference (target) state on a restart
-    target_state = current_state
 
     # set the boundary conditions
     def _ref_state_func(discr, btag, gas_model, ref_state, **kwargs):
@@ -1360,12 +1371,17 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                     velocity_gradient,
                     species_mass_fraction_gradient
                 )
-                ns_rhs, grad_cv, grad_t = \
-                    ns_operator(discr, state=fluid_state, time=t,
-                                boundaries=boundaries, gas_model=gas_model,
-                                return_gradients=True)
-                grad_v = velocity_gradient(cv, grad_cv)
-                grad_y = species_mass_fraction_gradient(cv, grad_cv)
+                # ns_rhs, grad_cv, grad_t = \
+                #    ns_operator(discr, state=fluid_state, time=t,
+                #                boundaries=boundaries, gas_model=gas_model,
+                #                return_gradients=True)
+                #grad_v = velocity_gradient(cv, grad_cv)
+                #grad_y = species_mass_fraction_gradient(cv, grad_cv)
+                ns_rhs = None
+                grad_cv = None
+                grad_t = None
+                grad_v = None
+                grad_y = None
                 my_write_viz(step=step, t=t, cv=cv, dv=dv,
                              ts_field=ts_field, alpha_field=alpha_field,
                              rhs=ns_rhs, grad_cv=grad_cv, grad_t=grad_t,
@@ -1390,22 +1406,24 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
             set_dt(logmgr, dt)
             set_sim_state(logmgr, dim, cv, gas_model.eos)
             logmgr.tick_after()
+        # return state, dt
         return make_obj_array([fluid_state.cv, fluid_state.temperature]), dt
 
     def my_rhs_without_combustion(t, state):
         cv, tseed = state
-        fluid_state = make_fluid_state(cv=cv, gas_model=gas_model,
-                                       temperature_seed=tseed)
-        alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
+        fluid_state = make_fluid_state(cv=cv,
+                                       gas_model=gas_model, temperature_seed=tseed)
+        # alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
         cv_rhs = (
             ns_operator(discr, state=fluid_state, time=t, boundaries=boundaries,
                         gas_model=gas_model, quadrature_tag=quadrature_tag)
-            + av_laplacian_operator(discr, fluid_state=fluid_state,
-                                    boundaries=boundaries,
-                                    boundary_kwargs={"time": t,
-                                                     "gas_model": gas_model},
-                                    alpha=alpha_field, s0=s0_sc, kappa=kappa_sc,
-                                    quadrature_tag=quadrature_tag)
+            # + species_fraction_anomaly_relaxation(cv, alpha=1e9)
+            #            + av_laplacian_operator(discr, fluid_state=fluid_state,
+            #                                    boundaries=boundaries,
+            #                                    boundary_kwargs={"time": t,
+            #                                                     "gas_model": gas_model},
+            #                                    alpha=alpha_field, s0=s0_sc, kappa=kappa_sc,
+            #                                    quadrature_tag=quadrature_tag)
         )
         return make_obj_array([cv_rhs, 0*tseed])
 
