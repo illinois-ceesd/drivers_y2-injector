@@ -109,16 +109,13 @@ Physical Surface('domain') = {-1};
 
 Physical Curve('injection') = {-502};
 Physical Curve('outflow') = {454};
-Physical Curve('wall_cavity') = {
+Physical Curve('wall') = {
 451,
 452,
 453,
-500
-};
-
-Physical Curve('wall_injector') = {
-501,
-503
+500,
+503,
+501
 };
 
 // Create distance field from curves, cavity only

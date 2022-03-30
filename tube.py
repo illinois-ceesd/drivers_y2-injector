@@ -32,6 +32,7 @@ import logging
 import sys
 import yaml
 import numpy as np
+np.set_printoptions(threshold=sys.maxsize)
 import math
 import pyopencl as cl
 import numpy.linalg as la  # noqa
@@ -75,7 +76,9 @@ from mirgecom.integrators import (rk4_step, lsrk54_step, lsrk144_step,
 from mirgecom.steppers import advance_state
 from mirgecom.boundary import (
     PrescribedFluidBoundary,
+    #IsothermalNoSlipBoundary,
     IsothermalWallBoundary,
+    AdiabaticSlipBoundary,
     OutflowBoundary
 )
 import cantera
@@ -102,10 +105,154 @@ class MyRuntimeError(RuntimeError):
     pass
 
 
+from grudge.trace_pair import TracePair
+from mirgecom.inviscid import inviscid_flux_rusanov
+from mirgecom.viscous import viscous_flux_central
+
+
+class IsothermalWallBoundary2(PrescribedFluidBoundary):
+    r"""Isothermal viscous wall boundary.
+    This class implements an isothermal wall by:
+    Pescribed flux, *not* with Riemann solver
+    """
+
+    def __init__(self, wall_temperature=300):
+        """Initialize the boundary condition object."""
+        self._wall_temp = wall_temperature
+        PrescribedFluidBoundary.__init__(
+            self, boundary_state_func=self.isothermal_wall_state,
+            inviscid_flux_func=self.inviscid_wall_flux,
+            viscous_flux_func=self.viscous_wall_flux,
+            boundary_temperature_func=self.temperature_bc
+        )
+
+    def isothermal_wall_state(self, discr, btag, gas_model, state_minus, **kwargs):
+        """Return state with 0 velocities and energy(Twall)."""
+        temperature_wall = self._wall_temp + 0*state_minus.mass_density
+        #mom_plus = state_minus.mass_density*0.*state_minus.velocity
+        mom_plus = -state_minus.momentum_density
+        mass_frac_plus = state_minus.species_mass_fractions
+
+        internal_energy_plus = gas_model.eos.get_internal_energy(
+            temperature=temperature_wall, species_mass_fractions=mass_frac_plus)
+
+        total_energy_plus = state_minus.mass_density*internal_energy_plus
+
+        cv_plus = make_conserved(
+            state_minus.dim, mass=state_minus.mass_density, energy=total_energy_plus,
+            momentum=mom_plus, species_mass=state_minus.species_mass_density
+        )
+        return make_fluid_state(cv=cv_plus, gas_model=gas_model,
+                                temperature_seed=state_minus.temperature)
+
+    def inviscid_wall_flux(
+            self, discr, btag, gas_model, state_minus,
+            numerical_flux_func=inviscid_flux_rusanov, **kwargs):
+
+        #print(f"inviscid_wall_flux {btag=}")
+
+        temperature_wall = self._wall_temp + 0*state_minus.mass_density
+        mom_plus = -state_minus.momentum_density
+        mass_frac_plus = state_minus.species_mass_fractions
+
+        internal_energy_plus = gas_model.eos.get_internal_energy(
+            temperature=temperature_wall, species_mass_fractions=mass_frac_plus)
+
+        total_energy_plus = (state_minus.mass_density*internal_energy_plus
+                             + .5*np.dot(mom_plus, mom_plus))
+
+        """Return Riemann flux using state with mom opposite of interior state."""
+        wall_cv = make_conserved(dim=state_minus.dim,
+                                 mass=state_minus.mass_density,
+                                 momentum=mom_plus,
+                                 #energy=state_minus.energy_density,
+                                 energy=total_energy_plus,
+                                 species_mass=state_minus.species_mass_density)
+        wall_state = make_fluid_state(cv=wall_cv, gas_model=gas_model,
+                                      temperature_seed=state_minus.temperature)
+        state_pair = TracePair(btag, interior=state_minus, exterior=wall_state)
+
+        from mirgecom.inviscid import inviscid_facial_flux
+        #print(f"{wall_state=}")
+        wall_flux = inviscid_facial_flux(discr, gas_model=gas_model, state_pair=state_pair,
+                                   numerical_flux_func=numerical_flux_func,
+                                   local=True)
+        #print(f"{wall_flux=}")
+        return self._boundary_quantity(
+            discr, btag, wall_flux,
+            #inviscid_facial_flux(discr, gas_model=gas_model, state_pair=state_pair,
+                                 #numerical_flux_func=numerical_flux_func,
+                                 #local=True),
+            **kwargs)
+
+    def temperature_bc(self, state_minus, **kwargs):
+        """Get temperature value used in grad(T)."""
+        # return 2*self._wall_temp - state_minus.temperature
+        return 0.*state_minus.temperature + self._wall_temp
+
+    def viscous_wall_flux(self, discr, btag, gas_model, state_minus,
+                                           grad_cv_minus, grad_t_minus,
+                                           numerical_flux_func=viscous_flux_central,
+                                           **kwargs):
+        #print(f"viscous_wall_flux {btag=}")
+        #state_plus = state_minus
+        #state_plus.species_mass_density = -state_plus.species_mass_density
+
+        #wall_cv = make_conserved(dim=state_minus.dim,
+                                 #mass=state_minus.mass_density,
+                                 #momentum=-state_minus.momentum_density,
+                                 ##energy=state_minus.energy_density,
+                                 #energy=total_energy_plus,
+                                 #species_mass=state_minus.species_mass_density)
+        state_pair = self._boundary_state_pair(discr=discr, btag=btag,
+                                               gas_model=gas_model,
+                                               state_minus=state_minus, **kwargs)
+                                               #state_minus=state_plus, **kwargs)
+        grad_cv_pair = \
+            TracePair(btag, interior=grad_cv_minus,
+                      exterior=self._bnd_grad_cv_func(
+                          discr=discr, btag=btag, gas_model=gas_model,
+                          state_minus=state_minus, grad_cv_minus=grad_cv_minus,
+                          #state_minus=state_plus, grad_cv_minus=grad_cv_minus,
+                          grad_t_minus=grad_t_minus))
+
+        grad_t_pair = \
+            TracePair(
+                btag, interior=grad_t_minus,
+                exterior=self._bnd_grad_temperature_func(
+                    discr=discr, btag=btag, gas_model=gas_model,
+                    state_minus=state_minus, grad_cv_minus=grad_cv_minus,
+                    #state_minus=state_plus, grad_cv_minus=grad_cv_minus,
+                    grad_t_minus=grad_t_minus))
+
+        return self._boundary_quantity(
+            discr, btag,
+            quantity=numerical_flux_func(discr=discr, gas_model=gas_model,
+                                         state_pair=state_pair,
+                                         grad_cv_pair=grad_cv_pair,
+                                         grad_t_pair=grad_t_pair))
+
+        '''
+        from mirgecom.viscous import viscous_flux
+        actx = state_minus.array_context
+        normal = thaw(discr.normal(state_pair.dd), actx)
+        #print(f"{normal=}")
+        cv_ext = state_pair.ext
+        cv_ext.species_mass_density = -cv_ext.species_mass_density
+        f_ext = viscous_flux(state_pair.ext, grad_cv_pair.ext,
+                            grad_t_pair.ext)
+        #print(f"{f_ext=}")
+
+        return self._boundary_quantity(
+            discr, btag,
+            quantity=f_ext@normal)
+            '''
+
+
 def get_mesh(dim, read_mesh=True):
     """Get the mesh."""
     from meshmode.mesh.io import read_gmsh
-    mesh_filename = "data/isolator.msh"
+    mesh_filename = "data/tube.msh"
     #mesh = read_gmsh(mesh_filename, force_ambient_dim=dim)
     mesh = partial(read_gmsh, filename=mesh_filename, force_ambient_dim=dim)
     #mesh = read_gmsh(mesh_filename)
@@ -1010,13 +1157,17 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
     ref_state = PrescribedFluidBoundary(boundary_state_func=_ref_boundary_state_func)
     outflow = OutflowBoundary(boundary_pressure=total_pres_inflow)
-    wall = IsothermalWallBoundary()
+    wall_injector = IsothermalWallBoundary()
+    symmetry = AdiabaticSlipBoundary()
+    #wall_cavity = IsothermalNoSlipBoundary()
+    #wall_injector = IsothermalNoSlipBoundary()
 
     boundaries = {
         #DTAG_BOUNDARY("outflow"): ref_state,
         DTAG_BOUNDARY("outflow"): outflow,
         DTAG_BOUNDARY("injection"): ref_state,
-        DTAG_BOUNDARY("wall"): wall
+        DTAG_BOUNDARY("wall_injector"): wall_injector,
+        DTAG_BOUNDARY("injector_symmetry"): symmetry
     }
 
     visualizer = make_visualizer(discr)
@@ -1100,7 +1251,21 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                        ("grad_v_x", grad_v[0]), ("grad_v_y", grad_v[1])]
             viz_ext.extend(("grad_Y_"+species_names[i], grad_y[i])
                            for i in range(nspecies))
-            viz_fields.extend(viz_ext)
+            from mirgecom.inviscid import inviscid_flux
+            fluid_state = create_fluid_state(cv=cv, temperature_seed=init_temperature)
+            inv_flux = inviscid_flux(state=fluid_state)
+            viz_ext2 = [("inviscid_flux_mass", inv_flux.mass)]
+            viz_ext2.extend(("inviscid_flux_"+species_names[i],
+                             inv_flux.species_mass[i]) for i in range(nspecies))
+            viz_fields.extend(viz_ext2)
+            from mirgecom.viscous import viscous_flux
+            vis_flux = viscous_flux(state=fluid_state, grad_cv=grad_cv, grad_t=grad_t)
+            viz_ext3 = [("viscous_flux_mass", vis_flux.mass)]
+            viz_ext3.extend(("viscous_flux_"+species_names[i],
+                             vis_flux.species_mass[i]) for i in range(nspecies))
+            viz_fields.extend(viz_ext3)
+
+
         write_visfile(discr, viz_fields, visualizer, vizname=vizname,
                       step=step, t=t, overwrite=True)
 
@@ -1322,12 +1487,12 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         cv_rhs = (
             ns_operator(discr, state=fluid_state, time=t, boundaries=boundaries,
                         gas_model=gas_model, quadrature_tag=quadrature_tag)
-            + av_laplacian_operator(discr, fluid_state=fluid_state,
-                                    boundaries=boundaries,
-                                    boundary_kwargs={"time": t,
-                                                     "gas_model": gas_model},
-                                    alpha=alpha_field, s0=s0_sc, kappa=kappa_sc,
-                                    quadrature_tag=quadrature_tag)
+            #+ av_laplacian_operator(discr, fluid_state=fluid_state,
+                                    #boundaries=boundaries,
+                                    #boundary_kwargs={"time": t,
+                                                     #"gas_model": gas_model},
+                                    #alpha=alpha_field, s0=s0_sc, kappa=kappa_sc,
+                                    #quadrature_tag=quadrature_tag)
         )
         return make_obj_array([cv_rhs, 0*tseed])
 
@@ -1378,8 +1543,21 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                                         state=current_state, alpha=alpha_field)
     my_write_status(dt=dt, cfl=cfl, cv=current_state.cv, dv=final_dv)
 
+    from mirgecom.fluid import (
+        velocity_gradient,
+        species_mass_fraction_gradient
+    )
+    ns_rhs, grad_cv, grad_t = \
+        ns_operator(discr, state=current_state, time=current_t,
+                    boundaries=boundaries, gas_model=gas_model,
+                    return_gradients=True)
+    grad_v = velocity_gradient(current_state.cv, grad_cv)
+    grad_y = species_mass_fraction_gradient(current_state.cv, grad_cv)
     my_write_viz(step=current_step, t=current_t, cv=current_state.cv, dv=final_dv,
-                 ts_field=ts_field, alpha_field=alpha_field)
+                 ts_field=ts_field, alpha_field=alpha_field,
+                 rhs=ns_rhs, grad_cv=grad_cv, grad_t=grad_t,
+                 grad_v=grad_v, grad_y=grad_y)
+
     my_write_restart(step=current_step, t=current_t, cv=current_state.cv,
                      temperature_seed=tseed)
 

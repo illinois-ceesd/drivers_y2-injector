@@ -1,9 +1,9 @@
-nviz: 100
-nrestart: 1000
+nviz: 50
+nrestart: 500
 nhealth: 1
 nstatus: 1
-current_dt: 1.e-8
-t_final: 1.e-4
+current_dt: 1e-8
+t_final: 2.5e-5
 order:  2
 #alpha_sc: 0.001
 alpha_sc: 0.
