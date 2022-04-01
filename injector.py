@@ -1136,7 +1136,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     def my_write_viz(step, t, fluid_state, ts_field, alpha_field):
 
         if rank == 0:
-            print(f"******** Writing Visualization File at {step=}, "
+            print(f"******** Writing Visualization File at {step}, "
                   f"sim time {t:1.6e} s ********")
 
         cv = fluid_state.cv
@@ -1367,49 +1367,40 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         toler = 1.e-6
         status = False
 
-        #print(f"{time=}")
-        #print(f"{dt=}")
-        #print(f"{interval=}")
-
         dumps_so_far = math.floor((time-t_start)/interval)
-
-        print(f"{dumps_so_far=}")
 
         # dump if we just passed a dump interval
         if interval_type == 2:
             time_till_next = (dumps_so_far + 1)*interval - time
             steps_till_next = math.floor(time_till_next/dt)
-            print(f"{steps_till_next=}")
+
             # reduce the timestep going into a dump to avoid a big variation in dt
             dt_new = dt
             if steps_till_next < 5:
                 extra_time = time_till_next - steps_till_next*dt
-                print(f"{extra_time=}")
-                print(f"reducing dt from {dt=}")
-                dt_new = time_till_next/(steps_till_next + 1)
-                print(f"to {dt_new=}")
+                if abs(extra_time/dt) > toler:
+                    dt_new = time_till_next/(steps_till_next + 1)
 
             if steps_till_next < 1:
-                print("dumping next {time_till_next=}")
                 dt_new = time_till_next
-                #status = True
-                # last simulation time step, will write output at the end
-                #if abs(time + dt_new - t_final) < toler:
-                #    status = False
 
             # adjust cfl and dt accordingly
             cfl = cfl/dt
             dt = dt_new
             cfl = cfl*dt
 
-        time_from_last = time - t_start - (dumps_so_far)*interval
-        #dump_now = abs(time_from_last - dt)/dt
-        if abs(time_from_last/dt) < toler:
-            status = True
+            time_from_last = time - t_start - (dumps_so_far)*interval
+            if abs(time_from_last/dt) < toler:
+                status = True
+        else:
+            time_from_last = time - t_start - (dumps_so_far)*interval
+            if time_from_last < dt:
+                status = True
 
         return status, cfl, dt
 
     def my_pre_step(step, t, dt, state):
+
         cv, tseed = state
         fluid_state = create_fluid_state(cv=cv, temperature_seed=tseed)
         dv = fluid_state.dv
@@ -1457,8 +1448,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         except MyRuntimeError:
             if rank == 0:
                 logger.error("Errors detected; attempting graceful exit.")
-            my_write_viz(step=step, t=t, fluid_state=fluid_state, ts_field=ts_field,
-                         alpha_field=alpha_field)
+            my_write_viz(step=step, t=t, fluid_state=fluid_state,
+                         ts_field=ts_field, alpha_field=alpha_field)
             my_write_restart(step=step, t=t, cv=cv, temperature_seed=tseed)
             raise
 
@@ -1539,7 +1530,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                                         state=current_state, alpha=alpha_field)
     my_write_status(dt=dt, cfl=cfl, cv=current_state.cv, dv=final_dv)
 
-    my_write_viz(step=current_step, t=current_t, fluid_state=current_state,
+    dump_step = current_step
+    my_write_viz(step=dump_step, t=current_t, fluid_state=current_state,
                  ts_field=ts_field, alpha_field=alpha_field)
     my_write_restart(step=current_step, t=current_t, cv=current_state.cv,
                      temperature_seed=tseed)
@@ -1548,9 +1540,6 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         logmgr.close()
     elif use_profiling:
         print(actx.tabulate_profiling_data())
-
-    finish_tol = 1e-16
-    assert np.abs(current_t - t_final) < finish_tol
 
 
 if __name__ == "__main__":
