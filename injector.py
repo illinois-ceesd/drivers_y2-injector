@@ -518,15 +518,21 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     nhealth = 1
     nrestart = 5000
     nstatus = 1
+    # verbosity for what gets written to viz dumps, increase for more stuff
+    viz_level = 1
+    # control the time interval for writing viz dumps
+    viz_interval_type = 0
 
     # default timestepping control
     integrator = "rk4"
     current_dt = 1e-8
-    t_final = 1e-7
+    t_final = 1e-6
+    t_viz_interval = 1.e-7
     current_t = 0
+    t_start = 0
     current_step = 0
     current_cfl = 0.5
-    constant_cfl = False
+    constant_cfl = 0
 
     # default health status bounds
     health_pres_min = 1.0e-1
@@ -579,6 +585,14 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         except KeyError:
             pass
         try:
+            t_viz_interval = float(input_data["t_viz_interval"])
+        except KeyError:
+            pass
+        try:
+            viz_interval_type = int(input_data["viz_interval_type"])
+        except KeyError:
+            pass
+        try:
             nrestart = int(input_data["nrestart"])
         except KeyError:
             pass
@@ -591,7 +605,15 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         except KeyError:
             pass
         try:
+            constant_cfl = int(input_data["constant_cfl"])
+        except KeyError:
+            pass
+        try:
             current_dt = float(input_data["current_dt"])
+        except KeyError:
+            pass
+        try:
+            current_cfl = float(input_data["current_cfl"])
         except KeyError:
             pass
         try:
@@ -687,11 +709,19 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
             temp_sigma_inj = float(input_data["temp_sigma_inj"])
         except KeyError:
             pass
+        try:
+            viz_level = int(input_data["viz_level"])
+        except KeyError:
+            pass
 
     # param sanity check
     allowed_integrators = ["rk4", "euler", "lsrk54", "lsrk144"]
     if integrator not in allowed_integrators:
         error_message = "Invalid time integrator: {}".format(integrator)
+        raise RuntimeError(error_message)
+
+    if viz_interval_type > 2:
+        error_message = "Invalid value for viz_interval_type [0-2]"
         raise RuntimeError(error_message)
 
     s0_sc = np.log10(1.0e-4 / np.power(order, 4))
@@ -701,16 +731,40 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
     if rank == 0:
         print("\n#### Simluation control data: ####")
-        print(f"\tnviz = {nviz}")
         print(f"\tnrestart = {nrestart}")
         print(f"\tnhealth = {nhealth}")
         print(f"\tnstatus = {nstatus}")
-        print(f"\tcurrent_dt = {current_dt}")
+        if constant_cfl == 1:
+            print(f"\tConstant cfl mode, current_cfl = {current_cfl}")
+        else:
+            print(f"\tConstant dt mode, current_dt = {current_dt}")
         print(f"\tt_final = {t_final}")
         print(f"\torder = {order}")
         print(f"\tdimen = {dim}")
         print(f"\tTime integration {integrator}")
-        print("#### Simluation control data: ####\n")
+        print("#### Simluation control data: ####")
+
+    if rank == 0:
+        print("\n#### Visualization setup: ####")
+        if viz_level >= 0:
+            print("\tBasic visualization output enabled.")
+            print("\t(cv, dv, cfl)")
+        if viz_level >= 1:
+            print("\tExtra visualization output enabled for derived quantities.")
+            print("\t(velocity, mass_fractions, etc.)")
+        if viz_level >= 2:
+            print("\tNon-dimensional parameter visualization output enabled.")
+            print("\t(Re, Pr, etc.)")
+        if viz_level >= 3:
+            print("\tDebug visualization output enabled.")
+            print("\t(rhs, grad_cv, etc.)")
+        if viz_interval_type == 0:
+            print(f"\tWriting viz data every {nviz} steps.")
+        if viz_interval_type == 1:
+            print(f"\tWriting viz data roughly every {t_viz_interval} seconds.")
+        if viz_interval_type == 2:
+            print(f"\tWriting viz data exactly every {t_viz_interval} seconds.")
+        print("#### Visualization setup: ####")
 
     if rank == 0:
         print("\n#### Simluation setup data: ####")
@@ -891,6 +945,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         restart_data = read_restart_data(actx, restart_filename)
         current_step = restart_data["step"]
         current_t = restart_data["t"]
+        t_start = current_t
         local_mesh = restart_data["local_mesh"]
         local_nelements = local_mesh.nelements
         global_nelements = restart_data["global_nelements"]
@@ -1078,33 +1133,91 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         if rank == 0:
             logger.info(status_msg)
 
-    def my_write_viz(step, t, cv, dv, ts_field, alpha_field,
-                     rhs=None, grad_cv=None, grad_t=None, grad_v=None,
-                     grad_y=None):
-        tagged_cells = smoothness_indicator(discr, cv.mass, s0=s0_sc,
-                                            kappa=kappa_sc)
-        mach = cv.speed / dv.speed_of_sound
+    def my_write_viz(step, t, fluid_state, ts_field, alpha_field):
+
+        if rank == 0:
+            print(f"******** Writing Visualization File at {step=}, "
+                  f"sim time {t:1.6e} s ********")
+
+        cv = fluid_state.cv
+        dv = fluid_state.dv
+
+        # basic viz quantities, things here are difficult (or impossible) to compute
+        # in post-processing
         viz_fields = [("cv", cv),
                       ("dv", dv),
-                      ("mach", mach),
-                      ("velocity", cv.velocity),
-                      ("alpha", alpha_field),
-                      ("tagged_cells", tagged_cells),
                       ("dt" if constant_cfl else "cfl", ts_field)]
-        # species mass fractions
-        viz_fields.extend(
-            ("Y_"+species_names[i], cv.species_mass_fractions[i])
-            for i in range(nspecies))
-        if rhs is not None:
-            viz_ext = [("rhs", rhs), ("grad_temperature", grad_t),
+
+        # extra viz quantities, things here are often used for post-processing
+        if viz_level > 0:
+            mach = cv.speed / dv.speed_of_sound
+            tagged_cells = smoothness_indicator(discr, cv.mass, s0=s0_sc,
+                                                kappa=kappa_sc)
+            viz_ext = [("mach", mach),
+                       ("velocity", cv.velocity),
+                       ("alpha", alpha_field),
+                       ("tagged_cells", tagged_cells)]
+            viz_fields.extend(viz_ext)
+            # species mass fractions
+            viz_fields.extend(
+                ("Y_"+species_names[i], cv.species_mass_fractions[i])
+                for i in range(nspecies))
+
+        # additional viz quantities, add in some non-dimensional numbers
+        if viz_level > 1:
+            from grudge.dt_utils import characteristic_lengthscales
+            char_length = characteristic_lengthscales(cv.array_context, discr)
+            cell_Re = cv.mass*cv.speed*char_length/fluid_state.viscosity
+            cp = gas_model.eos.heat_capacity_cp(cv, fluid_state.temperature)
+            alpha_heat = fluid_state.thermal_conductivity/cp/fluid_state.viscosity
+            cell_Pe_heat = char_length*cv.speed/alpha_heat
+            from mirgecom.viscous import get_local_max_species_diffusivity
+            d_alpha_max = \
+                get_local_max_species_diffusivity(
+                    fluid_state.array_context,
+                    fluid_state.species_diffusivity
+                )
+            cell_Pe_mass = char_length*cv.speed/d_alpha_max
+            # these are useful if our transport properties
+            # are not constant on the mesh
+            # prandtl
+            # schmidt_number
+            # damkohler_number
+
+            viz_ext = [("Re", cell_Re),
+                       ("Pe_mass", cell_Pe_mass),
+                       ("Pe_heat", cell_Pe_heat)]
+            viz_fields.extend(viz_ext)
+        # debbuging viz quantities, things here are used for diagnosing run issues
+        if viz_level > 2:
+            from mirgecom.fluid import (
+                velocity_gradient,
+                species_mass_fraction_gradient
+            )
+            ns_rhs, grad_cv, grad_t = \
+                ns_operator(discr, state=fluid_state, time=t,
+                            boundaries=boundaries, gas_model=gas_model,
+                            return_gradients=True)
+            grad_v = velocity_gradient(cv, grad_cv)
+            grad_y = species_mass_fraction_gradient(cv, grad_cv)
+
+            viz_ext = [("rhs", ns_rhs), ("grad_temperature", grad_t),
                        ("grad_v_x", grad_v[0]), ("grad_v_y", grad_v[1])]
             viz_ext.extend(("grad_Y_"+species_names[i], grad_y[i])
                            for i in range(nspecies))
             viz_fields.extend(viz_ext)
+
         write_visfile(discr, viz_fields, visualizer, vizname=vizname,
                       step=step, t=t, overwrite=True)
 
+        if rank == 0:
+            print("******** Done Writing Visualization File ********\n")
+
     def my_write_restart(step, t, cv, temperature_seed):
+        if rank == 0:
+            print(f"******** Writing Restart File at {step=}, "
+                  f"sim time {t:1.6e} s ********")
+
         restart_fname = restart_pattern.format(cname=casename, step=step, rank=rank)
         if restart_fname != restart_filename:
             restart_data = {
@@ -1119,6 +1232,9 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                 "num_parts": nparts
             }
             write_restart_file(actx, restart_data, restart_fname, comm)
+
+        if rank == 0:
+            print("******** Done Writing Restart File ********\n")
 
     def my_health_check(cv, dv):
         health_error = False
@@ -1247,6 +1363,52 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
         return alpha_field
 
+    def check_time(time, cfl, dt, interval, interval_type):
+        toler = 1.e-6
+        status = False
+
+        #print(f"{time=}")
+        #print(f"{dt=}")
+        #print(f"{interval=}")
+
+        dumps_so_far = math.floor((time-t_start)/interval)
+
+        print(f"{dumps_so_far=}")
+
+        # dump if we just passed a dump interval
+        if interval_type == 2:
+            time_till_next = (dumps_so_far + 1)*interval - time
+            steps_till_next = math.floor(time_till_next/dt)
+            print(f"{steps_till_next=}")
+            # reduce the timestep going into a dump to avoid a big variation in dt
+            dt_new = dt
+            if steps_till_next < 5:
+                extra_time = time_till_next - steps_till_next*dt
+                print(f"{extra_time=}")
+                print(f"reducing dt from {dt=}")
+                dt_new = time_till_next/(steps_till_next + 1)
+                print(f"to {dt_new=}")
+
+            if steps_till_next < 1:
+                print("dumping next {time_till_next=}")
+                dt_new = time_till_next
+                #status = True
+                # last simulation time step, will write output at the end
+                #if abs(time + dt_new - t_final) < toler:
+                #    status = False
+
+            # adjust cfl and dt accordingly
+            cfl = cfl/dt
+            dt = dt_new
+            cfl = cfl*dt
+
+        time_from_last = time - t_start - (dumps_so_far)*interval
+        #dump_now = abs(time_from_last - dt)/dt
+        if abs(time_from_last/dt) < toler:
+            status = True
+
+        return status, cfl, dt
+
     def my_pre_step(step, t, dt, state):
         cv, tseed = state
         fluid_state = create_fluid_state(cv=cv, temperature_seed=tseed)
@@ -1257,9 +1419,20 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                 logmgr.tick_before()
 
             alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
+            dt_last = dt
             ts_field, cfl, dt = my_get_timestep(t, dt, fluid_state, alpha_field)
 
-            do_viz = check_step(step=step, interval=nviz)
+            if viz_interval_type == 1:
+                do_viz, cfl, dt = check_time(time=t, cfl=cfl, dt=dt_last,
+                                             interval=t_viz_interval,
+                                             interval_type=viz_interval_type)
+            elif viz_interval_type == 2:
+                do_viz, cfl, dt = check_time(time=t, cfl=cfl, dt=dt,
+                                             interval=t_viz_interval,
+                                             interval_type=viz_interval_type)
+            else:
+                do_viz = check_step(step=step, interval=nviz)
+
             do_restart = check_step(step=step, interval=nrestart)
             do_health = check_step(step=step, interval=nhealth)
             do_status = check_step(step=step, interval=nstatus)
@@ -1278,25 +1451,13 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                 my_write_restart(step=step, t=t, cv=cv, temperature_seed=tseed)
 
             if do_viz:
-                from mirgecom.fluid import (
-                    velocity_gradient,
-                    species_mass_fraction_gradient
-                )
-                ns_rhs, grad_cv, grad_t = \
-                    ns_operator(discr, state=fluid_state, time=t,
-                                boundaries=boundaries, gas_model=gas_model,
-                                return_gradients=True)
-                grad_v = velocity_gradient(cv, grad_cv)
-                grad_y = species_mass_fraction_gradient(cv, grad_cv)
-                my_write_viz(step=step, t=t, cv=cv, dv=dv,
-                             ts_field=ts_field, alpha_field=alpha_field,
-                             rhs=ns_rhs, grad_cv=grad_cv, grad_t=grad_t,
-                             grad_v=grad_v, grad_y=grad_y)
+                my_write_viz(step=step, t=t, fluid_state=fluid_state,
+                             ts_field=ts_field, alpha_field=alpha_field)
 
         except MyRuntimeError:
             if rank == 0:
                 logger.error("Errors detected; attempting graceful exit.")
-            my_write_viz(step=step, t=t, cv=cv, dv=dv, ts_field=ts_field,
+            my_write_viz(step=step, t=t, fluid_state=fluid_state, ts_field=ts_field,
                          alpha_field=alpha_field)
             my_write_restart(step=step, t=t, cv=cv, temperature_seed=tseed)
             raise
@@ -1378,7 +1539,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                                         state=current_state, alpha=alpha_field)
     my_write_status(dt=dt, cfl=cfl, cv=current_state.cv, dv=final_dv)
 
-    my_write_viz(step=current_step, t=current_t, cv=current_state.cv, dv=final_dv,
+    my_write_viz(step=current_step, t=current_t, fluid_state=current_state,
                  ts_field=ts_field, alpha_field=alpha_field)
     my_write_restart(step=current_step, t=current_t, cv=current_state.cv,
                      temperature_seed=tseed)

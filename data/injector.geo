@@ -159,7 +159,7 @@ Field[6].VIn = cavitysize;
 Field[6].VOut = bigsize;
 
 // background mesh size for the injector
-injector_start = 0.70;
+injector_start = 0.69;
 injector_end = 0.75;
 injector_bottom = -0.022;
 injector_top = -0.025;
