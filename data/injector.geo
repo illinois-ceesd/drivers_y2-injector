@@ -109,16 +109,13 @@ Physical Surface('domain') = {-1};
 
 Physical Curve('injection') = {-502};
 Physical Curve('outflow') = {454};
-Physical Curve('wall_cavity') = {
+Physical Curve('wall') = {
 451,
 452,
 453,
-500
-};
-
-Physical Curve('wall_injector') = {
-501,
-503
+500,
+503,
+501
 };
 
 // Create distance field from curves, cavity only
@@ -162,7 +159,7 @@ Field[6].VIn = cavitysize;
 Field[6].VOut = bigsize;
 
 // background mesh size for the injector
-injector_start = 0.70;
+injector_start = 0.69;
 injector_end = 0.75;
 injector_bottom = -0.022;
 injector_top = -0.025;

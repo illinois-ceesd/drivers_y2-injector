@@ -1,0 +1,13 @@
+nviz: 100
+nrestart: 10000
+nhealth: 1
+nstatus: 1
+#current_dt: 5e-8
+current_dt: 2e-7
+t_final: 1e-3
+spec_diff: 0.5
+dimen: 2
+order: 1
+integrator: euler
+health_pres_min: 1
+health_pres_max: 1e7
