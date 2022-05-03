@@ -286,8 +286,8 @@ class InitACTII:
         inj_right = 0.73
         inj_top = -0.0226
         inj_bottom = -0.025
-        inj_fore = 0.035/2. + 1.59e-3
-        inj_aft = 0.035/2. - 1.59e-3
+        inj_fore = 0.01/2. + 1.59e-3
+        inj_aft = 0.01/2. - 1.59e-3
         xc_left = zeros + inj_left
         xc_right = zeros + inj_right
         yc_top = zeros + inj_top
@@ -296,7 +296,7 @@ class InitACTII:
         zc_aft = zeros + inj_aft
 
         yc_center = zeros - 0.0283245 + 4e-3 + 1.59e-3/2.
-        zc_center = zeros + 0.035/2.
+        zc_center = zeros + 0.01/2.
         inj_radius = 1.59e-3/2.
         #inj_bl_thickness = inj_radius/3.
         inj_bl_thickness = -1000
@@ -532,7 +532,8 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     t_start = 0
     current_step = 0
     current_cfl = 0.5
-    constant_cfl = 0
+    constant_cfl = False
+    last_viz_interval = 0
 
     # default health status bounds
     health_pres_min = 1.0e-1
@@ -945,6 +946,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         restart_data = read_restart_data(actx, restart_filename)
         current_step = restart_data["step"]
         current_t = restart_data["t"]
+        last_viz_interval = restart_data["last_viz_interval"]
         t_start = current_t
         local_mesh = restart_data["local_mesh"]
         local_nelements = local_mesh.nelements
@@ -1133,11 +1135,12 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         if rank == 0:
             logger.info(status_msg)
 
-    def my_write_viz(step, t, fluid_state, ts_field, alpha_field):
+    def my_write_viz(step, t, fluid_state, ts_field, alpha_field, dump_number):
 
         if rank == 0:
-            print(f"******** Writing Visualization File at {step}, "
-                  f"sim time {t:1.6e} s ********")
+            print(f"******** Writing Visualization File {dump_number}, "
+                  f" at step {step},"
+                  f" sim time {t:1.6e} s ********")
 
         cv = fluid_state.cv
         dv = fluid_state.dv
@@ -1208,7 +1211,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
             viz_fields.extend(viz_ext)
 
         write_visfile(discr, viz_fields, visualizer, vizname=vizname,
-                      step=step, t=t, overwrite=True)
+                      step=dump_number, t=t, overwrite=True)
 
         if rank == 0:
             print("******** Done Writing Visualization File ********\n")
@@ -1228,6 +1231,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                 "t": t,
                 "step": step,
                 "order": order,
+                "last_viz_interval": last_viz_interval,
                 "global_nelements": global_nelements,
                 "num_parts": nparts
             }
@@ -1271,7 +1275,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
         return health_error
 
-    def my_get_viscous_timestep(discr, state, alpha):
+    def my_get_viscous_timestep(state, alpha):
         """Routine returns the the node-local maximum stable viscous timestep.
 
         Parameters
@@ -1329,24 +1333,29 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         :class:`~meshmode.dof_array.DOFArray`
             The CFL at each node.
         """
-        return dt / my_get_viscous_timestep(discr, state=state, alpha=alpha)
+        return dt / my_get_viscous_timestep(state=state, alpha=alpha)
 
-    def my_get_timestep(t, dt, state, alpha):
-        t_remaining = max(0, t_final - t)
+    def _my_get_timestep(discr, fluid_state, alpha, t, dt, cfl, t_final,
+                         constant_cfl=False):
+        mydt = dt
         if constant_cfl:
-            ts_field = current_cfl * my_get_viscous_timestep(discr, state=state,
-                                                             alpha=alpha)
             from grudge.op import nodal_min
-            dt = actx.to_numpy(nodal_min(discr, "vol", ts_field))
-            cfl = current_cfl
+            ts_field = cfl*my_get_viscous_timestep(
+                state=fluid_state, alpha=alpha)
+            mydt = fluid_state.array_context.to_numpy(nodal_min(
+                    discr, "vol", ts_field))[()]
         else:
-            ts_field = my_get_viscous_cfl(discr, dt=dt, state=state, alpha=alpha)
             from grudge.op import nodal_max
-            cfl = actx.to_numpy(nodal_max(discr, "vol", ts_field))
+            ts_field = mydt/my_get_viscous_timestep(
+                state=fluid_state, alpha=alpha)
+            cfl = fluid_state.array_context.to_numpy(nodal_max(
+                    discr, "vol", ts_field))[()]
 
-        return ts_field, cfl, min(t_remaining, dt)
+        return ts_field, cfl, mydt
 
-    def my_get_alpha(discr, state, alpha):
+    my_get_timestep = _my_get_timestep
+
+    def my_get_alpha(state, alpha):
         """ Scale alpha by the element characteristic length """
         from grudge.dt_utils import characteristic_lengthscales
         array_context = state.array_context
@@ -1363,7 +1372,9 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
 
         return alpha_field
 
-    def check_time(time, cfl, dt, interval, interval_type):
+    #my_get_alpha = actx.compile(get_alpha)
+
+    def _my_check_time(time, dt, interval, interval_type):
         toler = 1.e-6
         status = False
 
@@ -1375,19 +1386,16 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
             steps_till_next = math.floor(time_till_next/dt)
 
             # reduce the timestep going into a dump to avoid a big variation in dt
-            dt_new = dt
             if steps_till_next < 5:
+                dt_new = dt
                 extra_time = time_till_next - steps_till_next*dt
                 if abs(extra_time/dt) > toler:
                     dt_new = time_till_next/(steps_till_next + 1)
 
-            if steps_till_next < 1:
-                dt_new = time_till_next
+                if steps_till_next < 1:
+                    dt_new = time_till_next
 
-            # adjust cfl and dt accordingly
-            cfl = cfl/dt
-            dt = dt_new
-            cfl = cfl*dt
+                dt = dt_new
 
             time_from_last = time - t_start - (dumps_so_far)*interval
             if abs(time_from_last/dt) < toler:
@@ -1397,7 +1405,9 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
             if time_from_last < dt:
                 status = True
 
-        return status, cfl, dt
+        return status, dt, dumps_so_far + last_viz_interval
+
+    my_check_time = _my_check_time
 
     def my_pre_step(step, t, dt, state):
 
@@ -1409,20 +1419,40 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
             if logmgr:
                 logmgr.tick_before()
 
-            alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
-            dt_last = dt
-            ts_field, cfl, dt = my_get_timestep(t, dt, fluid_state, alpha_field)
+            alpha_field = my_get_alpha(fluid_state, alpha_sc)
+
+            ts_field_fluid, cfl_fluid, dt_fluid = my_get_timestep(
+                discr=discr, fluid_state=fluid_state, alpha=alpha_field,
+                t=t, dt=dt, cfl=current_cfl, t_final=t_final,
+                constant_cfl=constant_cfl)
+
+            # adjust time to hit the final requested time
+            t_remaining = max(0, t_final - t)
+
+            if viz_interval_type == 0:
+                dt = np.minimum(t_remaining, current_dt)
+            else:
+                dt = np.minimum(t_remaining, dt_fluid)
+
+            # update our I/O quantities
+            cfl_fluid = dt*cfl_fluid/dt_fluid
+            ts_field_fluid = dt*ts_field_fluid/dt_fluid
 
             if viz_interval_type == 1:
-                do_viz, cfl, dt = check_time(time=t, cfl=cfl, dt=dt_last,
-                                             interval=t_viz_interval,
-                                             interval_type=viz_interval_type)
+                do_viz, dt, next_dump_number = my_check_time(
+                    time=t, dt=dt, interval=t_viz_interval,
+                    interval_type=viz_interval_type)
             elif viz_interval_type == 2:
-                do_viz, cfl, dt = check_time(time=t, cfl=cfl, dt=dt,
-                                             interval=t_viz_interval,
-                                             interval_type=viz_interval_type)
+                dt_sav = dt
+                do_viz, dt, next_dump_number = my_check_time(
+                    time=t, dt=dt, interval=t_viz_interval,
+                    interval_type=viz_interval_type)
+
+                # adjust cfl by dt
+                cfl_fluid = dt*cfl_fluid/dt_sav
             else:
                 do_viz = check_step(step=step, interval=nviz)
+                next_dump_number = step
 
             do_restart = check_step(step=step, interval=nrestart)
             do_health = check_step(step=step, interval=nhealth)
@@ -1436,20 +1466,22 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
                     raise MyRuntimeError("Failed simulation health check.")
 
             if do_status:
-                my_write_status(dt=dt, cfl=cfl, dv=dv, cv=cv)
+                my_write_status(dt=dt, cfl=cfl_fluid, dv=dv, cv=cv)
 
             if do_restart:
                 my_write_restart(step=step, t=t, cv=cv, temperature_seed=tseed)
 
             if do_viz:
                 my_write_viz(step=step, t=t, fluid_state=fluid_state,
-                             ts_field=ts_field, alpha_field=alpha_field)
+                             ts_field=ts_field_fluid, alpha_field=alpha_field,
+                             dump_number=next_dump_number)
 
         except MyRuntimeError:
             if rank == 0:
                 logger.error("Errors detected; attempting graceful exit.")
             my_write_viz(step=step, t=t, fluid_state=fluid_state,
-                         ts_field=ts_field, alpha_field=alpha_field)
+                         ts_field=ts_field_fluid, alpha_field=alpha_field,
+                         dump_number=next_dump_number)
             my_write_restart(step=step, t=t, cv=cv, temperature_seed=tseed)
             raise
 
@@ -1470,7 +1502,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         cv, tseed = state
         fluid_state = make_fluid_state(cv=cv, gas_model=gas_model,
                                        temperature_seed=tseed)
-        alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
+        alpha_field = my_get_alpha(fluid_state, alpha_sc)
         cv_rhs = (
             ns_operator(discr, state=fluid_state, time=t, boundaries=boundaries,
                         gas_model=gas_model, quadrature_tag=quadrature_tag)
@@ -1487,7 +1519,7 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
         cv, tseed = state
         fluid_state = make_fluid_state(cv=cv, gas_model=gas_model,
                                        temperature_seed=tseed)
-        alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
+        alpha_field = my_get_alpha(fluid_state, alpha_sc)
         #from mirgecom.inviscid import inviscid_flux_hll
         cv_rhs = (
             ns_operator(discr, state=fluid_state, time=t, boundaries=boundaries,
@@ -1525,14 +1557,23 @@ def main(ctx_factory=cl.create_some_context, restart_filename=None,
     if rank == 0:
         logger.info("Checkpointing final state ...")
     final_dv = current_state.dv
-    alpha_field = my_get_alpha(discr, current_state, alpha_sc)
-    ts_field, cfl, dt = my_get_timestep(t=current_t, dt=current_dt,
-                                        state=current_state, alpha=alpha_field)
+    alpha_field = my_get_alpha(current_state, alpha_sc)
+    ts_field_fluid, cfl, dt = my_get_timestep(discr=discr,
+        fluid_state=current_state,
+        alpha=alpha_field, t=current_t, dt=current_dt, cfl=current_cfl,
+        t_final=t_final, constant_cfl=constant_cfl)
     my_write_status(dt=dt, cfl=cfl, cv=current_state.cv, dv=final_dv)
+
+    if viz_interval_type == 0:
+        dump_number = current_step
+    else:
+        dump_number = (math.floor((current_t-t_start)/t_viz_interval) +
+            last_viz_interval)
 
     dump_step = current_step
     my_write_viz(step=dump_step, t=current_t, fluid_state=current_state,
-                 ts_field=ts_field, alpha_field=alpha_field)
+                 ts_field=ts_field_fluid, alpha_field=alpha_field,
+                 dump_number=dump_number)
     my_write_restart(step=current_step, t=current_t, cv=current_state.cv,
                      temperature_seed=tseed)
 
