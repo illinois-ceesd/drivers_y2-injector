@@ -14,10 +14,13 @@ s0_sc: -5.0
 kappa_sc: 0.5
 #integrator: lsrk54
 #integrator: rk4
-integrator: rk4
+#integrator: rk4
+integrator: euler
 spec_diff: 1.e-4
 #spec_diff: 0.
 nspecies: 7
+pyro_temp_iter: 1
+pyro_temp_tol: 1e-4
 mach_inj: 1.0
 #total_pres_inj: 1e4
 total_pres_inj: 50400
